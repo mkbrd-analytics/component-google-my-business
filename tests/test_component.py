@@ -15,6 +15,7 @@ from keboola.component.exceptions import UserException
 
 from component import Component
 from google_my_business import (
+    AVAILABLE_DAILY_METRICS,
     GoogleMyBusiness,
     GoogleMyBusinessException,
     GoogleMyBusinessRequestError,
@@ -119,6 +120,130 @@ class TestGetRequestErrorHandling(unittest.TestCase):
                         comp.run()
 
         self.assertIn("Request failed with status code 503", str(ctx.exception))
+
+
+class TestFetchMultiDailyMetrics(unittest.TestCase):
+    """``list_daily_metrics`` fetches every metric in one request.
+
+    It calls fetchMultiDailyMetricsTimeSeries instead of getDailyMetricsTimeSeries once
+    per metric. The return shape and the metric names must be unchanged, because the
+    ``metric`` column downstream holds the API's enum names verbatim.
+    """
+
+    @staticmethod
+    def _make_client():
+        return GoogleMyBusiness(
+            access_token="tok",
+            data_folder_path=tempfile.gettempdir(),
+            start_timestamp="2026-03-01T00:00:00.000000Z",
+            end_timestamp="2026-03-02T00:00:00.000000Z",
+        )
+
+    @staticmethod
+    def _series(metric, dated_values, sub_entity_type=None):
+        series = {"dailyMetric": metric, "timeSeries": {"datedValues": dated_values}}
+        if sub_entity_type is not None:
+            series["dailySubEntityType"] = sub_entity_type
+        return series
+
+    def _run(self, payload, status=200):
+        gmb = self._make_client()
+        resp = mock.Mock(status_code=status, text="")
+        resp.json.return_value = payload
+        with mock.patch.object(gmb, "get_request", return_value=(status, resp)) as mock_request:
+            result = gmb.list_daily_metrics("locations/12345")
+        return result, mock_request
+
+    def test_single_request_carries_every_metric_and_the_date_range(self):
+        result, mock_request = self._run({"multiDailyMetricTimeSeries": []})
+
+        # One request for the whole location, not one per metric.
+        self.assertEqual(mock_request.call_count, 1)
+
+        params = mock_request.call_args.kwargs["params"]
+        self.assertEqual(params["dailyMetrics"], AVAILABLE_DAILY_METRICS)
+        self.assertNotIn("dailyMetric", params)
+        self.assertEqual(
+            (params["dailyRange.startDate.year"], params["dailyRange.startDate.month"]),
+            (2026, 3),
+        )
+        self.assertEqual(params["dailyRange.endDate.day"], 2)
+        self.assertEqual(mock_request.call_args.kwargs["url"].split(":")[-1], "fetchMultiDailyMetricsTimeSeries")
+        self.assertEqual(result, {})
+
+    def test_parses_multiple_metrics_into_the_legacy_shape(self):
+        payload = {
+            "multiDailyMetricTimeSeries": [
+                {
+                    "dailyMetricTimeSeries": [
+                        self._series(
+                            "CALL_CLICKS",
+                            [
+                                {"date": {"year": 2026, "month": 3, "day": 1}, "value": "7"},
+                                {"date": {"year": 2026, "month": 3, "day": 2}, "value": "3"},
+                            ],
+                        ),
+                        self._series(
+                            "WEBSITE_CLICKS",
+                            [{"date": {"year": 2026, "month": 3, "day": 1}, "value": "11"}],
+                        ),
+                    ]
+                }
+            ]
+        }
+        result, _ = self._run(payload)
+
+        self.assertEqual(
+            result,
+            {
+                "2026-03-01": {"CALL_CLICKS": 7, "WEBSITE_CLICKS": 11},
+                "2026-03-02": {"CALL_CLICKS": 3},
+            },
+        )
+        # Metric keys stay the API enum names, so the stored `metric` column is unchanged.
+        self.assertIn("CALL_CLICKS", result["2026-03-01"])
+
+    def test_absent_value_counts_as_zero(self):
+        payload = {
+            "multiDailyMetricTimeSeries": [
+                {
+                    "dailyMetricTimeSeries": [
+                        self._series("BUSINESS_BOOKINGS", [{"date": {"year": 2026, "month": 3, "day": 1}}])
+                    ]
+                }
+            ]
+        }
+        result, _ = self._run(payload)
+        self.assertEqual(result, {"2026-03-01": {"BUSINESS_BOOKINGS": 0}})
+
+    def test_sub_entity_breakdown_does_not_overwrite_the_location_total(self):
+        """A breakdown series carries the same metric split by sub-entity.
+
+        We never request breakdowns, but if one arrives it must not clobber the total.
+        """
+        payload = {
+            "multiDailyMetricTimeSeries": [
+                {
+                    "dailyMetricTimeSeries": [
+                        self._series(
+                            "CALL_CLICKS",
+                            [{"date": {"year": 2026, "month": 3, "day": 1}, "value": "7"}],
+                        ),
+                        self._series(
+                            "CALL_CLICKS",
+                            [{"date": {"year": 2026, "month": 3, "day": 1}, "value": "2"}],
+                            sub_entity_type={"dayOfWeek": "MONDAY"},
+                        ),
+                    ]
+                }
+            ]
+        }
+        result, _ = self._run(payload)
+        self.assertEqual(result, {"2026-03-01": {"CALL_CLICKS": 7}})
+
+    def test_forbidden_location_returns_empty_without_raising(self):
+        result, _ = self._run({}, status=403)
+        self.assertEqual(result, {})
 
 
 if __name__ == "__main__":

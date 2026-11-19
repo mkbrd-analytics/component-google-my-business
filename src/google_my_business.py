@@ -337,45 +337,66 @@ class GoogleMyBusiness:
 
     def list_daily_metrics(self, location_id):
         """
-        Fetching all the report insights from assigned location.
+        Fetching all the report insights from assigned location in a single request.
+
+        Uses fetchMultiDailyMetricsTimeSeries, which returns every requested metric at
+        once, rather than calling getDailyMetricsTimeSeries once per metric (which cost
+        one request per metric per location). The return shape is unchanged:
+        ``{"YYYY-MM-DD": {"METRIC_NAME": int_value}}``, and metric names are the API's
+        enum names, exactly as before.
+
         https://developers.google.com/my-business/reference/performance/rest/v1/
-        locations/getDailyMetricsTimeSeries#DailyRange
+        locations/fetchMultiDailyMetricsTimeSeries
         """
         start_year, start_month, start_day = get_date_from_string(self.start_timestamp)
         end_year, end_month, end_day = get_date_from_string(self.end_timestamp)
 
-        parsed_values = {}
-        for metric in AVAILABLE_DAILY_METRICS:
-            insight_url = self.base_url_profile_performance + f"/{location_id}:getDailyMetricsTimeSeries"
-            params = {
-                "dailyMetric": metric,
-                "dailyRange.startDate.year": start_year,
-                "dailyRange.startDate.month": start_month,
-                "dailyRange.startDate.day": start_day,
-                "dailyRange.endDate.year": end_year,
-                "dailyRange.endDate.month": end_month,
-                "dailyRange.endDate.day": end_day,
-            }
+        insight_url = self.base_url_profile_performance + f"/{location_id}:fetchMultiDailyMetricsTimeSeries"
+        params = {
+            "dailyMetrics": AVAILABLE_DAILY_METRICS,
+            "dailyRange.startDate.year": start_year,
+            "dailyRange.startDate.month": start_month,
+            "dailyRange.startDate.day": start_day,
+            "dailyRange.endDate.year": end_year,
+            "dailyRange.endDate.month": end_month,
+            "dailyRange.endDate.day": end_day,
+        }
 
-            header = {"Content-type": "application/json", "Authorization": f"Bearer {self.access_token}"}
+        header = {"Content-type": "application/json", "Authorization": f"Bearer {self.access_token}"}
 
-            res_status, insights_raw = self.get_request(url=insight_url, headers=header, params=params)
+        res_status, insights_raw = self.get_request(url=insight_url, headers=header, params=params)
 
-            if res_status != 200:
-                if res_status == 403:
-                    logging.error(
-                        f"Cannot fetch daily metrics for location with id {location_id}, response: {insights_raw.text}"
-                    )
-                    return {}
-                raise GoogleMyBusinessException(
-                    f"Something wrong with report insight request. Response: {insights_raw.text}"
+        if res_status != 200:
+            if res_status == 403:
+                logging.error(
+                    f"Cannot fetch daily metrics for location with id {location_id}, response: {insights_raw.text}"
                 )
+                return {}
+            raise GoogleMyBusinessException(
+                f"Something wrong with report insight request. Response: {insights_raw.text}"
+            )
 
-            response = insights_raw.json()
-            if "timeSeries" in response:
-                time_series = response["timeSeries"]["datedValues"]
+        response = insights_raw.json()
 
-                for dated_value in time_series:
+        parsed_values = {}
+        returned_metrics = set()
+
+        for multi_series in response.get("multiDailyMetricTimeSeries", []):
+            for metric_series in multi_series.get("dailyMetricTimeSeries", []):
+                metric = metric_series.get("dailyMetric")
+                if not metric:
+                    continue
+
+                # Breakdowns are never requested. A sub-entity series carries the same
+                # metric split by sub-entity, so letting one through would overwrite the
+                # location total for that date.
+                if metric_series.get("dailySubEntityType"):
+                    logging.debug(f"Skipping {metric} sub-entity breakdown for location {location_id}.")
+                    continue
+
+                returned_metrics.add(metric)
+
+                for dated_value in metric_series.get("timeSeries", {}).get("datedValues", []):
                     date = (
                         f"{dated_value['date']['year']}-{dated_value['date']['month']:02d}-"
                         f"{dated_value['date']['day']:02d}"
@@ -385,8 +406,11 @@ class GoogleMyBusiness:
                         parsed_values[date] = {}
                     parsed_values[date][metric] = value
 
-            else:
-                logging.info(f"Metric {metric} did not return any time series.")
+        missing_metrics = [metric for metric in AVAILABLE_DAILY_METRICS if metric not in returned_metrics]
+        if missing_metrics:
+            logging.info(
+                f"Metrics that returned no time series for location {location_id}: {', '.join(missing_metrics)}"
+            )
 
         return parsed_values
 
